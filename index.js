@@ -1,28 +1,91 @@
 const {
   Client,
   GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
-  PermissionsBitField
+  PermissionFlagsBits
 } = require("discord.js");
 
 const fs = require("fs");
+
+const TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = "1572049078655651921";
+const GUILD_ID = "1541743590836011109";
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-const TOKEN = process.env.DISCORD_TOKEN;
-const DATA_FILE = "./attendance.json";
+const FILE = "./attendance.json";
 
-let attendance = fs.existsSync(DATA_FILE)
-  ? JSON.parse(fs.readFileSync(DATA_FILE, "utf8"))
-  : {};
+function loadData() {
+  if (!fs.existsSync(FILE)) {
+    fs.writeFileSync(FILE, JSON.stringify({ users: {} }, null, 2));
+  }
+  return JSON.parse(fs.readFileSync(FILE, "utf8"));
+}
+
+let data = loadData();
 
 function saveData() {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(attendance, null, 2));
+  fs.writeFileSync(FILE, JSON.stringify(data, null, 2));
+}
+
+function getUser(id, name) {
+  if (!data.users[id]) {
+    data.users[id] = {
+      name,
+      totalMs: 0,
+      activeSince: null,
+      sessions: []
+    };
+  }
+
+  data.users[id].name = name;
+  return data.users[id];
+}
+
+function formatTime(ms) {
+  const hours = Math.floor(ms / 3600000);
+  const minutes = Math.floor((ms % 3600000) / 60000);
+  return `${hours} ساعة و ${minutes} دقيقة`;
+}
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName("setup")
+    .setDescription("إنشاء لوحة تسجيل الدوام")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName("report")
+    .setDescription("عرض تقرير ساعات الدوام")
+    .addUserOption(option =>
+      option
+        .setName("member")
+        .setDescription("اختر الموظف")
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("rank")
+    .setDescription("عرض ترتيب الموظفين حسب ساعات الدوام")
+];
+
+async function registerCommands() {
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+
+  await rest.put(
+    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+    { body: commands.map(command => command.toJSON()) }
+  );
+
+  console.log("تم تسجيل أوامر البوت بنجاح");
 }
 
 client.once("ready", () => {
@@ -30,86 +93,186 @@ client.once("ready", () => {
 });
 
 client.on("interactionCreate", async interaction => {
-  if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === "setup") {
-      if (!interaction.memberPermissions.has(PermissionsBitField.Flags.Administrator)) {
-        return interaction.reply({ content: "ليس لديك صلاحية.", ephemeral: true });
+  try {
+
+    if (interaction.isChatInputCommand()) {
+
+      if (interaction.commandName === "setup") {
+
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+          return interaction.reply({
+            content: "ليس لديك صلاحية استخدام هذا الأمر.",
+            ephemeral: true
+          });
+        }
+
+        const embed = new EmbedBuilder()
+          .setColor("#1687d9")
+          .setTitle("نظام دوام النقل")
+          .setDescription(
+            "أهلاً بك في نظام تسجيل الدوام.\n\n" +
+            "🟢 اضغط تسجيل دخول عند بداية عملك.\n" +
+            "🔴 اضغط تسجيل خروج عند انتهاء عملك.\n\n" +
+            "سيتم احتساب ساعات عملك تلقائياً."
+          );
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId("checkin")
+            .setLabel("تسجيل دخول")
+            .setEmoji("🟢")
+            .setStyle(ButtonStyle.Success),
+
+          new ButtonBuilder()
+            .setCustomId("checkout")
+            .setLabel("تسجيل خروج")
+            .setEmoji("🔴")
+            .setStyle(ButtonStyle.Danger)
+        );
+
+        return interaction.reply({
+          embeds: [embed],
+          components: [row]
+        });
       }
 
-      const embed = new EmbedBuilder()
-        .setTitle("🚛 نظام دوام النقل")
-        .setDescription("اضغط الزر المناسب لتسجيل دوامك.\n\n🟢 تسجيل دخول\n🔴 تسجيل خروج")
-        .setColor("Blue");
+      if (interaction.commandName === "report") {
 
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("checkin")
-          .setLabel("تسجيل دخول")
-          .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-          .setCustomId("checkout")
-          .setLabel("تسجيل خروج")
-          .setStyle(ButtonStyle.Danger)
-      );
+        const target = interaction.options.getUser("member") || interaction.user;
 
-      return interaction.reply({ embeds: [embed], components: [row] });
+        if (
+          target.id !== interaction.user.id &&
+          !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+        ) {
+          return interaction.reply({
+            content: "لا يمكنك عرض تقرير موظف آخر.",
+            ephemeral: true
+          });
+        }
+
+        const user = getUser(target.id, target.username);
+        let total = user.totalMs;
+
+        if (user.activeSince) {
+          total += Date.now() - user.activeSince;
+        }
+
+        const embed = new EmbedBuilder()
+          .setColor("#1687d9")
+          .setTitle("تقرير الدوام")
+          .addFields(
+            { name: "الموظف", value: `<@${target.id}>`, inline: true },
+            { name: "إجمالي ساعات العمل", value: formatTime(total), inline: true },
+            { name: "عدد أيام التسجيل", value: `${user.sessions.length}`, inline: true },
+            {
+              name: "حالة الدوام",
+              value: user.activeSince ? "🟢 على رأس العمل" : "🔴 خارج الدوام"
+            }
+          );
+
+        return interaction.reply({ embeds: [embed] });
+      }
+
+      if (interaction.commandName === "rank") {
+
+        const ranking = Object.entries(data.users)
+          .map(([id, user]) => {
+            let total = user.totalMs;
+            if (user.activeSince) total += Date.now() - user.activeSince;
+            return { id, name: user.name, total };
+          })
+          .sort((a, b) => b.total - a.total)
+          .slice(0, 10);
+
+        const description = ranking.length
+          ? ranking.map((u, i) =>
+              `**${i + 1}.** <@${u.id}> — ${formatTime(u.total)}`
+            ).join("\n")
+          : "لا توجد سجلات دوام حتى الآن.";
+
+        const embed = new EmbedBuilder()
+          .setColor("#e0a526")
+          .setTitle("🏆 ترتيب الموظفين")
+          .setDescription(description);
+
+        return interaction.reply({ embeds: [embed] });
+      }
     }
 
-    if (interaction.commandName === "report") {
-      if (!interaction.memberPermissions.has(PermissionsBitField.Flags.Administrator)) {
-        return interaction.reply({ content: "ليس لديك صلاحية.", ephemeral: true });
+    if (interaction.isButton()) {
+
+      const user = getUser(interaction.user.id, interaction.user.username);
+
+      if (interaction.customId === "checkin") {
+
+        if (user.activeSince) {
+          return interaction.reply({
+            content: "أنت مسجل دخول بالفعل!",
+            ephemeral: true
+          });
+        }
+
+        user.activeSince = Date.now();
+        saveData();
+
+        return interaction.reply({
+          content: `🟢 تم تسجيل دخولك بنجاح، بالتوفيق يا <@${interaction.user.id}>!`,
+          ephemeral: true
+        });
       }
 
-      const user = interaction.options.getUser("user");
-      const records = attendance[user.id] || [];
-      const total = records.reduce((sum, r) => sum + (r.hours || 0), 0);
+      if (interaction.customId === "checkout") {
 
-      return interaction.reply({
-        content: `📊 تقرير ${user.username}\nعدد الورديات: ${records.length}\nإجمالي الساعات: ${total.toFixed(2)} ساعة`,
-        ephemeral: true
-      });
+        if (!user.activeSince) {
+          return interaction.reply({
+            content: "أنت غير مسجل دخول حالياً!",
+            ephemeral: true
+          });
+        }
+
+        const start = user.activeSince;
+        const end = Date.now();
+        const duration = end - start;
+
+        user.totalMs += duration;
+        user.sessions.push({
+          start,
+          end,
+          duration
+        });
+
+        user.activeSince = null;
+        saveData();
+
+        return interaction.reply({
+          content:
+            `🔴 تم تسجيل خروجك بنجاح.\n` +
+            `⏱️ مدة دوامك: **${formatTime(duration)}**\n` +
+            `📊 إجمالي دوامك: **${formatTime(user.totalMs)}**`,
+          ephemeral: true
+        });
+      }
     }
-  }
 
-  if (interaction.isButton()) {
-    const id = interaction.user.id;
-    const now = Date.now();
+  } catch (error) {
+    console.error(error);
 
-    if (!attendance[id]) attendance[id] = [];
-
-    if (interaction.customId === "checkin") {
-      const active = attendance[id].some(r => !r.end);
-
-      if (active) {
-        return interaction.reply({ content: "أنت مسجل دخول بالفعل!", ephemeral: true });
-      }
-
-      attendance[id].push({ start: now, end: null, hours: 0 });
-      saveData();
-
-      return interaction.reply({
-        content: `🟢 تم تسجيل دخولك بنجاح!\nالوقت: <t:${Math.floor(now / 1000)}:F>`,
-        ephemeral: true
-      });
-    }
-
-    if (interaction.customId === "checkout") {
-      const record = [...attendance[id]].reverse().find(r => !r.end);
-
-      if (!record) {
-        return interaction.reply({ content: "ليس لديك دوام مفتوح!", ephemeral: true });
-      }
-
-      record.end = now;
-      record.hours = (now - record.start) / 3600000;
-      saveData();
-
-      return interaction.reply({
-        content: `🔴 تم تسجيل خروجك!\nمدة الدوام: ${record.hours.toFixed(2)} ساعة`,
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+      await interaction.reply({
+        content: "حدث خطأ، حاول مرة أخرى.",
         ephemeral: true
       });
     }
   }
 });
 
-client.login(TOKEN);
+async function start() {
+  if (!TOKEN) {
+    throw new Error("DISCORD_TOKEN غير موجود في متغيرات الاستضافة");
+  }
+
+  await registerCommands();
+  await client.login(TOKEN);
+}
+
+start().catch(console.error);
